@@ -61,8 +61,24 @@ const loginUser = async (req, res) => {
         );
 
         const updateSql = 'UPDATE users SET refresh_token = ? WHERE id = ?';
-        await pool.query(updateSql, [refreshToken, user.id ]);
-        res.json({ success: true, token: accessToken, user: { id: user.id, username: user.username, email: user.email } });
+        await pool.query(updateSql, [refreshToken, user.id]);
+        // 2. Attach it to an HttpOnly cookie
+        res.cookie('jwt', refreshToken, {
+            httpOnly: true, // Prevents frontend JS from reading it (Stops XSS attacks)
+            secure: process.env.NODE_ENV === 'production', // Requires HTTPS in production
+            sameSite: 'Strict', // Prevents Cross-Site Request Forgery (CSRF)
+            maxAge: 7 * 24 * 60 * 60 * 1000 // 7 days in milliseconds
+        });
+
+        res.json({
+            success: true,
+            accessToken: accessToken,
+            user: {
+                id: user.id,
+                username: user.username,
+                email: user.email
+            }
+        });
     } catch (error) {
         console.error('Error login user:', error.message);
         res.status(500).json({ success: false, error: 'Server error' });
@@ -72,20 +88,28 @@ const loginUser = async (req, res) => {
 // --- Logout User ---
 const logoutUser = async (req, res) => {
     try {
-        const { refreshToken } = req.body;
-
-        if (!refreshToken) {
-            return res.status(400).json({ success: false, message: 'Refresh token is required' });
+        const userId = req.user.userId;
+        // 1. Check if the cookie exists
+        const cookies = req.cookies;
+        if (!cookies?.jwt) {
+            // If there is no cookie, the user is already logged out.
+            // A 204 (No Content) status is standard here.
+            return res.status(204).send(); 
         }
 
         // Search the database for the user with this token and set it to NULL
-        const sql = 'UPDATE users SET refresh_token = NULL WHERE refresh_token = ?';
-        const [result] = await pool.query(sql, [refreshToken]);
+        const sql = 'UPDATE users SET refresh_token = NULL WHERE id = ? AND refresh_token IS NOT NULL';
+        const [result] = await pool.query(sql, userId);
 
         if (result.affectedRows === 0) {
-            return res.status(400).json({ success: false, message: 'Invalid token or already logged out' });
+            return res.status(400).json({ success: false, message: 'Already logged out' });
         }
-
+        // 3. Clear the cookie from the browser/client
+        res.clearCookie('jwt', {
+            httpOnly: true,
+            secure: process.env.NODE_ENV === 'production',
+            sameSite: 'Strict'
+        });
         res.status(200).json({ success: true, message: 'Logged out successfully' });
     } catch (error) {
         console.error('Error logging out:', error.message);
@@ -96,7 +120,7 @@ const logoutUser = async (req, res) => {
 // --- Refresh Token ---
 const refreshAccessToken = async (req, res) => {
     try {
-        const { refreshToken } = req.body;
+        const refreshToken = req.cookies.jwt;
 
         if (!refreshToken) {
             return res.status(401).json({ success: false, message: 'Refresh token is required' });
@@ -112,25 +136,30 @@ const refreshAccessToken = async (req, res) => {
 
         const user = rows[0];
 
-        // 2. Verify the refresh token cryptographically
-        jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET, (err, decoded) => {
-            if (err) {
-                // If token is expired or altered, return 403 Forbidden
-                return res.status(403).json({ success: false, message: 'Refresh token expired or invalid' });
-            }
+        // 2. Verify the Token synchronously
+        let decoded;
+        try {
+            decoded = JWT.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET);
+        } catch (err) {
+            return res.status(403).json({ success: false, message: 'Refresh token expired or invalid' });
+        }
 
-            // 3. Generate a new Access Token
-            const newAccessToken = jwt.sign(
-                { userId: user.id, email: user.email },
-                process.env.ACCESS_TOKEN_SECRET, 
-                { expiresIn: '15m' }
-            );
+        // 3. Security Check: Ensure the token payload matches the database owner
+        if (decoded.userId !== user.id) {
+            return res.status(403).json({ success: false, message: 'Token ownership mismatch' });
+        }
 
-            // 4. Send the new access token to the client
-            res.status(200).json({
-                success: true,
-                accessToken: newAccessToken
-            });
+        // 4. Generate a new Access Token using the verified payload data
+        const newAccessToken = JWT.sign(
+            { userId: decoded.userId, email: decoded.email },
+            process.env.ACCESS_TOKEN_SECRET,
+            { expiresIn: '15m' }
+        );
+
+        // 5. Send the new access token
+        res.status(200).json({
+            success: true,
+            accessToken: newAccessToken
         });
 
     } catch (error) {
